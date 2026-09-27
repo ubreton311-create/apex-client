@@ -14,6 +14,53 @@ export default function App() {
 
   const N8N_CHAT_URL = '/api-n8n/webhook/apex-core';
 
+  // ============ AUDIO UNLOCK PARA MÓVIL ============
+  React.useEffect(() => {
+    let unlocked = false;
+    const unlockAudio = () => {
+      if (unlocked) return;
+      unlocked = true;
+
+      console.log('🔓 Desbloqueando audio...');
+
+      // Desbloquear SpeechSynthesis con utterance silencioso
+      if (window.speechSynthesis) {
+        const silent = new SpeechSynthesisUtterance('');
+        silent.volume = 0;
+        silent.rate = 10;
+        window.speechSynthesis.speak(silent);
+        console.log('✅ SpeechSynthesis desbloqueado');
+      }
+
+      // Desbloquear AudioContext
+      try {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        if (ctx.state === 'suspended') {
+          ctx.resume().then(() => {
+            console.log('✅ AudioContext resumido');
+            ctx.close();
+          });
+        } else {
+          ctx.close();
+        }
+      } catch (err) {
+        console.warn('AudioContext unlock:', err);
+      }
+
+      // Remover listeners
+      document.removeEventListener('touchstart', unlockAudio);
+      document.removeEventListener('click', unlockAudio);
+    };
+
+    document.addEventListener('touchstart', unlockAudio, { once: true });
+    document.addEventListener('click', unlockAudio, { once: true });
+
+    return () => {
+      document.removeEventListener('touchstart', unlockAudio);
+      document.removeEventListener('click', unlockAudio);
+    };
+  }, []);
+
   // ============ ENVIAR TEXTO A APEX ============
   const sendToApex = async (text) => {
     if (!text || !text.trim()) return;
@@ -38,17 +85,58 @@ export default function App() {
     }
   };
 
-  // ============ SÍNTESIS DE VOZ ============
+  // ============ SÍNTESIS DE VOZ (MEJORADA PARA MÓVIL) ============
   const speakResponse = (text) => {
-    if (!window.speechSynthesis) return;
+    if (!window.speechSynthesis) {
+      console.warn('❌ speechSynthesis no disponible');
+      return;
+    }
+
+    console.log('🔊 Intentando hablar:', text.substring(0, 50));
     window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = 'es-MX';
-    utterance.rate = 1.0;
-    utterance.pitch = 0.9;
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    window.speechSynthesis.speak(utterance);
+
+    // iOS necesita un pequeño delay después de cancel
+    setTimeout(() => {
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.lang = 'es-MX';
+      utterance.rate = 1.0;
+      utterance.pitch = 0.9;
+      utterance.volume = 1.0;
+
+      const trySpeak = () => {
+        const voices = window.speechSynthesis.getVoices();
+        const spanishVoice = voices.find(v => v.lang.startsWith('es'));
+        if (spanishVoice) {
+          utterance.voice = spanishVoice;
+          console.log('✅ Voz seleccionada:', spanishVoice.name);
+        }
+
+        utterance.onstart = () => {
+          console.log('🎤 TTS iniciado');
+          setIsSpeaking(true);
+        };
+        utterance.onend = () => {
+          console.log('🎤 TTS terminado');
+          setIsSpeaking(false);
+        };
+        utterance.onerror = (e) => {
+          console.error('❌ TTS error:', e.error);
+          setIsSpeaking(false);
+        };
+
+        window.speechSynthesis.speak(utterance);
+      };
+
+      // En móvil, las voces cargan async
+      if (window.speechSynthesis.getVoices().length === 0) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          trySpeak();
+          window.speechSynthesis.onvoiceschanged = null;
+        };
+      } else {
+        trySpeak();
+      }
+    }, 100);
   };
 
   // ============ VOICE ASSISTANT (Wake word) ============

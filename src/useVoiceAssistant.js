@@ -11,11 +11,22 @@ export function useVoiceAssistant({ onTranscription }) {
   const fullBufferRef = useRef('');
   const lastSpokenTimeRef = useRef(Date.now());
   const restartCountRef = useRef(0);
+  const audioCtxRef = useRef(null);
 
-  // ============ BEEPS ============
+  // ============ BEEPS (FIX MÓVIL) ============
+  const getAudioContext = () => {
+    if (!audioCtxRef.current) {
+      audioCtxRef.current = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (audioCtxRef.current.state === 'suspended') {
+      audioCtxRef.current.resume();
+    }
+    return audioCtxRef.current;
+  };
+
   const playBeep = (freq, duration, volume = 0.15) => {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const ctx = getAudioContext();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.frequency.value = freq;
@@ -25,7 +36,7 @@ export function useVoiceAssistant({ onTranscription }) {
       gain.connect(ctx.destination);
       osc.start();
       osc.stop(ctx.currentTime + duration / 1000);
-      setTimeout(() => ctx.close(), duration + 100);
+      // ⚠️ NO cerrar el contexto (reutilizar)
     } catch (err) {
       console.error('Beep error:', err);
     }
@@ -35,24 +46,17 @@ export function useVoiceAssistant({ onTranscription }) {
   const beepSleep = () => playBeep(440, 250);
 
   // ============ UTILIDADES ============
-  // Deduplicar palabras y frases repetidas consecutivas
   const dedupe = (text) => {
     if (!text) return '';
-    // Quitar "nova", "noba", "no va" del texto
     let clean = text.replace(/\b(nova|noba|no va|no\s+va)\b/gi, '').trim();
 
-    // Quitar frases consecutivas repetidas (máx 6 palabras por frase)
     for (let i = 0; i < 5; i++) {
       clean = clean.replace(/\b((?:\w+\s+){0,5}\w+)(?:\s+\1\b)+/gi, '$1');
     }
 
-    // Quitar palabras individuales repetidas consecutivas
     clean = clean.replace(/\b(\w+)(?:\s+\1\b)+/gi, '$1');
-
-    // Normalizar espacios
     clean = clean.replace(/\s+/g, ' ').trim();
 
-    // Limitar longitud
     if (clean.length > 300) clean = clean.slice(0, 300);
 
     return clean;
@@ -135,7 +139,6 @@ export function useVoiceAssistant({ onTranscription }) {
 
       // ========== MODO 1: ESPERANDO "NOVA" ==========
       if (!wakeRef.current) {
-        // Solo guardar el texto ACTUAL (no acumular histórico)
         fullBufferRef.current = currentText;
         console.log('👂 Buffer actual:', fullBufferRef.current);
 
@@ -151,7 +154,6 @@ export function useVoiceAssistant({ onTranscription }) {
           setIsAwake(true);
           setListening(false);
 
-          // Capturar lo que venga después de "nova" en la misma frase
           const parts = currentText.split(/nova|noba|no va/i);
           const afterNova = parts[parts.length - 1]?.trim() || '';
           fullBufferRef.current = afterNova && afterNova.length > 3 ? afterNova + ' ' : '';
@@ -164,11 +166,9 @@ export function useVoiceAssistant({ onTranscription }) {
       }
 
       // ========== MODO 2: GRABANDO PREGUNTA ==========
-      // Solo usar el texto FINAL (isFinal=true) para evitar duplicados
       if (finalText) {
         const clean = finalText.replace(/nova|noba|no va/gi, '').trim();
         if (clean && clean.length > 2) {
-          // Solo agregar si no está ya en el buffer
           const bufferLower = fullBufferRef.current.toLowerCase();
           if (!bufferLower.includes(clean.toLowerCase())) {
             fullBufferRef.current += clean + ' ';
@@ -177,7 +177,6 @@ export function useVoiceAssistant({ onTranscription }) {
         }
       }
 
-      // Reiniciar timer de silencio
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = setTimeout(() => {
         if (Date.now() - lastSpokenTimeRef.current >= 1800) {
@@ -221,6 +220,9 @@ export function useVoiceAssistant({ onTranscription }) {
     return () => {
       try { recognition.stop(); } catch (e) {}
       clearTimeout(silenceTimerRef.current);
+      if (audioCtxRef.current) {
+        try { audioCtxRef.current.close(); } catch (e) {}
+      }
     };
     // eslint-disable-next-line
   }, []);
