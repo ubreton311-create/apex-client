@@ -1,0 +1,8 @@
+{
+  "rewrites": [
+    {
+      "source": "/api-n8n/:path*",
+      "destination": "https://bretudev.app.n8n.cloud/:path*"
+    }
+  ]
+}
