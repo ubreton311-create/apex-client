@@ -1,71 +1,149 @@
-import React, { useState, Suspense } from 'react';
+import React, { useState, Suspense, useEffect, useCallback } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, ContactShadows } from '@react-three/drei';
 import { ApexModel } from './ApexModel';
 import { useVoiceAssistant } from './useVoiceAssistant';
 import './App.css';
 
+const STATE_COLORS = {
+  idle: '#3b82f6',
+  listening: '#facc15',
+  thinking: '#f97316',
+  talking: '#10b981',
+  wake: '#00d4ff',
+};
+
+// ============ DETECTOR DE CONTENIDO MEJORADO ============
+const detectContentType = (text) => {
+  if (!text) return 'text';
+
+  // Bloques de código markdown
+  if (text.includes('```')) return 'code';
+
+  // Patrones de código comunes (def, function, const, import, etc.)
+  const codeKeywords = /\b(def |function |const |let |var |class |import |from |return |print\(|console\.log|=> |if \(|for \(|while \()/;
+  const codeSymbols = /[{}();]|=>|::|==/;
+  if (codeKeywords.test(text) && codeSymbols.test(text)) return 'code';
+
+  // Imágenes (markdown o URLs directas)
+  if (text.match(/!\[.*\]\(.*\)/)) return 'image';
+  if (text.match(/https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp|svg)/i)) return 'image';
+
+  // Listas / datos
+  if (text.match(/^[\-\*\d]+[\.\)]?\s/m)) return 'data';
+
+  // Enlaces
+  if (text.match(/https?:\/\/[^\s]+/)) return 'link';
+
+  return 'text';
+};
+
 export default function App() {
-  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [robotState, setRobotState] = useState('idle');
   const [inputText, setInputText] = useState('');
   const [responseMessage, setResponseMessage] = useState('');
+  const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState('Di "Nova" para despertarme');
+  const [lastTranscription, setLastTranscription] = useState('');
+  const [leftPanelOpen, setLeftPanelOpen] = useState(false);
+  const [rightPanelOpen, setRightPanelOpen] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const [flash, setFlash] = useState(false);
+  const [contentType, setContentType] = useState('text');
 
   const N8N_CHAT_URL = '/api-n8n/webhook/apex-core';
 
-  // ============ AUDIO UNLOCK PARA MÓVIL ============
-  React.useEffect(() => {
+  // ============ DETECCIÓN MÓVIL ============
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 900);
+    checkMobile();
+    window.addEventListener('resize', checkMobile);
+    return () => window.removeEventListener('resize', checkMobile);
+  }, []);
+
+  // ============ RELOJ ============
+  const [time, setTime] = useState(() => {
+    const d = new Date();
+    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  });
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const d = new Date();
+      setTime(`${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`);
+    }, 10000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // ============ AUDIO UNLOCK ============
+  useEffect(() => {
     let unlocked = false;
     const unlockAudio = () => {
       if (unlocked) return;
       unlocked = true;
-
-      console.log('🔓 Desbloqueando audio...');
-
-      // Desbloquear SpeechSynthesis con utterance silencioso
       if (window.speechSynthesis) {
         const silent = new SpeechSynthesisUtterance('');
         silent.volume = 0;
         silent.rate = 10;
         window.speechSynthesis.speak(silent);
-        console.log('✅ SpeechSynthesis desbloqueado');
       }
-
-      // Desbloquear AudioContext
       try {
         const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        if (ctx.state === 'suspended') {
-          ctx.resume().then(() => {
-            console.log('✅ AudioContext resumido');
-            ctx.close();
-          });
-        } else {
-          ctx.close();
-        }
-      } catch (err) {
-        console.warn('AudioContext unlock:', err);
-      }
-
-      // Remover listeners
+        if (ctx.state === 'suspended') ctx.resume().then(() => ctx.close());
+        else ctx.close();
+      } catch (e) {}
       document.removeEventListener('touchstart', unlockAudio);
       document.removeEventListener('click', unlockAudio);
     };
-
     document.addEventListener('touchstart', unlockAudio, { once: true });
     document.addEventListener('click', unlockAudio, { once: true });
-
     return () => {
       document.removeEventListener('touchstart', unlockAudio);
       document.removeEventListener('click', unlockAudio);
     };
   }, []);
 
-  // ============ ENVIAR TEXTO A APEX ============
-  const sendToApex = async (text) => {
+  // ============ TTS ============
+  const speakResponse = useCallback((text) => {
+    if (!window.speechSynthesis) return;
+    window.speechSynthesis.cancel();
+    setTimeout(() => {
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'es-MX';
+      u.rate = 1.0;
+      u.pitch = 0.9;
+      u.volume = 1.0;
+      const trySpeak = () => {
+        const voices = window.speechSynthesis.getVoices();
+        const esp = voices.find(v => v.lang.startsWith('es'));
+        if (esp) u.voice = esp;
+        u.onstart = () => setRobotState('talking');
+        u.onend = () => setRobotState('idle');
+        u.onerror = () => setRobotState('idle');
+        window.speechSynthesis.speak(u);
+      };
+      if (window.speechSynthesis.getVoices().length === 0) {
+        window.speechSynthesis.onvoiceschanged = () => {
+          trySpeak();
+          window.speechSynthesis.onvoiceschanged = null;
+        };
+      } else trySpeak();
+    }, 100);
+  }, []);
+
+  // ============ ENVIAR A APEX ============
+  const sendToApex = useCallback(async (text) => {
     if (!text || !text.trim()) return;
     setLoading(true);
-    setStatus('Apex pensando...');
+    setRobotState('thinking');
+    setLastTranscription(text);
+
+    const newUserMsg = {
+      role: 'user',
+      text,
+      time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }),
+    };
+    setConversation(prev => [...prev, newUserMsg]);
+
     try {
       const res = await fetch(N8N_CHAT_URL, {
         method: 'POST',
@@ -75,138 +153,197 @@ export default function App() {
       const data = await res.json();
       const reply = data.reply || data.output || data.text || 'Sin respuesta';
       setResponseMessage(reply);
-      setStatus('Di "Nova" para continuar');
+
+      const newApexMsg = {
+        role: 'apex',
+        text: reply,
+        time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }),
+      };
+      setConversation(prev => [...prev, newApexMsg]);
+
+      const detected = detectContentType(reply);
+      setContentType(detected);
+      console.log('🎯 Tipo de contenido detectado:', detected);
+
+      if (!isMobile) setLeftPanelOpen(true);
+      if (detected !== 'text' && !isMobile) setRightPanelOpen(true);
+
       speakResponse(reply);
     } catch (err) {
       console.error(err);
-      setStatus('Error al conectar con Apex');
+      setResponseMessage('Error al conectar con Apex');
+      setRobotState('idle');
     } finally {
       setLoading(false);
     }
-  };
+  }, [speakResponse, isMobile]);
 
-  // ============ SÍNTESIS DE VOZ (MEJORADA PARA MÓVIL) ============
-  const speakResponse = (text) => {
-    if (!window.speechSynthesis) {
-      console.warn('❌ speechSynthesis no disponible');
-      return;
-    }
-
-    console.log('🔊 Intentando hablar:', text.substring(0, 50));
-    window.speechSynthesis.cancel();
-
-    // iOS necesita un pequeño delay después de cancel
-    setTimeout(() => {
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = 'es-MX';
-      utterance.rate = 1.0;
-      utterance.pitch = 0.9;
-      utterance.volume = 1.0;
-
-      const trySpeak = () => {
-        const voices = window.speechSynthesis.getVoices();
-        const spanishVoice = voices.find(v => v.lang.startsWith('es'));
-        if (spanishVoice) {
-          utterance.voice = spanishVoice;
-          console.log('✅ Voz seleccionada:', spanishVoice.name);
-        }
-
-        utterance.onstart = () => {
-          console.log('🎤 TTS iniciado');
-          setIsSpeaking(true);
-        };
-        utterance.onend = () => {
-          console.log('🎤 TTS terminado');
-          setIsSpeaking(false);
-        };
-        utterance.onerror = (e) => {
-          console.error('❌ TTS error:', e.error);
-          setIsSpeaking(false);
-        };
-
-        window.speechSynthesis.speak(utterance);
-      };
-
-      // En móvil, las voces cargan async
-      if (window.speechSynthesis.getVoices().length === 0) {
-        window.speechSynthesis.onvoiceschanged = () => {
-          trySpeak();
-          window.speechSynthesis.onvoiceschanged = null;
-        };
-      } else {
-        trySpeak();
-      }
-    }, 100);
-  };
-
-  // ============ VOICE ASSISTANT (Wake word) ============
+  // ============ VOICE ASSISTANT ============
   const { isAwake, isRecording, listening } = useVoiceAssistant({
     onTranscription: sendToApex,
   });
 
-  // Actualizar estado visual
-  React.useEffect(() => {
-    if (isRecording) setStatus('✉️ Enviando a Apex...');
-    else if (isAwake) setStatus('🔴 Te escucho...');
-    else if (listening) setStatus('Di "Nova" para despertarme');
-  }, [isAwake, isRecording, listening]);
+  // ============ FLASH AL DESPERTAR ============
+  useEffect(() => {
+    if (isAwake) {
+      setFlash(true);
+      const t = setTimeout(() => setFlash(false), 500);
+      return () => clearTimeout(t);
+    }
+  }, [isAwake]);
+
+  // ============ DERIVAR ESTADO ============
+  useEffect(() => {
+    if (isRecording) setRobotState('thinking');
+    else if (isAwake) {
+      setRobotState('wake');
+      const t = setTimeout(() => setRobotState('listening'), 2000);
+      return () => clearTimeout(t);
+    } else if (listening && !loading && robotState !== 'talking') {
+      setRobotState('listening');
+    }
+  }, [isAwake, isRecording, listening, loading, robotState]);
+
+  const statusLabel = {
+    idle: '● EN ESPERA',
+    listening: '● ESCUCHANDO',
+    thinking: '● PROCESANDO',
+    talking: '● RESPONDIENDO',
+    wake: '● DESPERTANDO',
+  }[robotState] || '● EN ESPERA';
+
+  const statusColor = STATE_COLORS[robotState] || STATE_COLORS.idle;
+
+  // ============ LÓGICA DE VISIBILIDAD ============
+  const hasConversation = conversation.length > 0;
+  const hasSpecialContent = contentType !== 'text' && responseMessage;
+
+  const showRightPanel = !isMobile && hasSpecialContent && rightPanelOpen;
+
+  // Robot se mueve solo si panel derecho está abierto
+  const robotOffsetX = showRightPanel ? -0.9 : 0;
+  const robotScale = showRightPanel ? 0.28 : 0.32;
 
   return (
-    <div style={{ width: '100vw', height: '100vh', position: 'relative', background: '#111827' }}>
-      <Canvas camera={{ position: [0, 1.5, 4.5], fov: 45 }} style={{ width: '100%', height: '100%' }}>
-        <ambientLight intensity={0.8} />
-        <directionalLight position={[5, 8, 5]} intensity={1.5} />
-        <pointLight position={[-5, 2, -2]} intensity={0.5} color="#60a5fa" />
-        <Suspense fallback={null}>
-          <ApexModel talking={isSpeaking} />
-          <ContactShadows position={[0, -1.1, 0]} opacity={0.6} scale={10} blur={1.5} />
-        </Suspense>
-        <OrbitControls enablePan={false} minDistance={2} maxDistance={7} maxPolarAngle={Math.PI / 2} />
-      </Canvas>
-
-      {/* Indicador de estado superior */}
-      <div style={{
-        position: 'absolute',
-        top: '20px',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        padding: '8px 20px',
-        background: isRecording ? 'rgba(239, 68, 68, 0.9)' : isAwake ? 'rgba(250, 204, 21, 0.9)' : 'rgba(59, 130, 246, 0.9)',
-        color: '#fff',
-        borderRadius: '20px',
-        fontSize: '14px',
-        fontWeight: 600,
-        transition: 'all 0.3s',
-        zIndex: 10,
-      }}>
-        {status}
+    <div className="apex-container">
+      <div className="apex-background">
+        <div className="bg-grid"></div>
+        <div className="bg-glow bg-glow-1"></div>
+        <div className="bg-glow bg-glow-2"></div>
       </div>
 
-      {/* Panel inferior - SOLO INPUT DE TEXTO */}
-      <div style={{
-        position: 'absolute',
-        bottom: '24px',
-        left: '50%',
-        transform: 'translateX(-50%)',
-        width: '90%',
-        maxWidth: '520px',
-        background: 'rgba(17, 24, 39, 0.85)',
-        backdropFilter: 'blur(10px)',
-        padding: '16px',
-        borderRadius: '12px',
-        border: '1px solid rgba(255, 255, 255, 0.1)',
-        color: '#fff',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '10px',
-        zIndex: 10,
-      }}>
-        {responseMessage && (
-          <div style={{ fontSize: '14px', color: '#93c5fd', maxHeight: '80px', overflowY: 'auto' }}>
-            <strong>Apex:</strong> {responseMessage}
-          </div>
-        )}
+      <Canvas
+        camera={{ position: [0, 0.6, 5], fov: 45 }}
+        style={{ position: 'absolute', top: 0, left: 0, width: '100%', height: '100%' }}
+      >
+        <ambientLight intensity={0.9} />
+        <directionalLight position={[5, 8, 5]} intensity={1.5} />
+        <pointLight position={[-5, 2, -2]} intensity={0.6} color="#60a5fa" />
+        <pointLight position={[5, 2, -2]} intensity={0.6} color={statusColor} />
 
+        <Suspense fallback={null}>
+          <AuraRing color={statusColor} pulse={robotState !== 'idle'} flash={flash} offsetX={robotOffsetX} />
+
+          <ApexModel
+            robotState={robotState}
+            offsetX={robotOffsetX}
+            scaleTarget={robotScale}
+          />
+
+          <ContactShadows position={[0, -1.5, 0]} opacity={0.5} scale={7} blur={2} />
+        </Suspense>
+
+        <OrbitControls
+          enablePan={false}
+          minDistance={2}
+          maxDistance={7}
+          maxPolarAngle={Math.PI / 2}
+          enableZoom={!isMobile}
+        />
+      </Canvas>
+
+      <div className="hud hud-top-left">
+        <div className="hud-time">{time}</div>
+        <div className="hud-version">APEX v0.4</div>
+      </div>
+
+      <div className="hud hud-top-right">
+        <div className="hud-status" style={{ color: statusColor, textShadow: `0 0 10px ${statusColor}` }}>
+          {statusLabel}
+        </div>
+      </div>
+
+      <div className="hud hud-bottom-left">
+        <div className="hud-mic">
+          <span className={`mic-dot ${listening ? 'active' : ''}`}></span>
+          MIC {listening ? 'ON' : 'OFF'}
+        </div>
+      </div>
+
+      <div className="hud hud-bottom-right">
+        {lastTranscription && (
+          <div className="hud-transcription">"{lastTranscription.slice(0, 60)}"</div>
+        )}
+      </div>
+
+      {/* Toggle IZQUIERDO */}
+      {hasConversation && !isMobile && (
+        <button
+          className="panel-toggle panel-toggle-left"
+          onClick={() => setLeftPanelOpen(!leftPanelOpen)}
+        >
+          {leftPanelOpen ? '◀' : '▶'}
+        </button>
+      )}
+
+      {/* Toggle DERECHO */}
+      {hasSpecialContent && !isMobile && (
+        <button
+          className="panel-toggle panel-toggle-right"
+          onClick={() => setRightPanelOpen(!rightPanelOpen)}
+        >
+          {rightPanelOpen ? '▶' : '◀'}
+        </button>
+      )}
+
+      {/* Panel IZQUIERDO */}
+      {hasConversation && (
+        <div className={`panel panel-left ${leftPanelOpen ? 'open' : 'closed'}`}>
+          <div className="panel-header">
+            <span>💬 CONVERSACIÓN</span>
+            <button className="panel-close" onClick={() => setLeftPanelOpen(false)}>×</button>
+          </div>
+          <div className="panel-content">
+            {conversation.map((msg, i) => (
+              <div key={i} className={`msg msg-${msg.role}`}>
+                <div className="msg-header">
+                  {msg.role === 'user' ? 'TÚ' : 'APEX'} · {msg.time}
+                </div>
+                <div className="msg-text">{msg.text}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Panel DERECHO */}
+      {hasSpecialContent && (
+        <div className={`panel panel-right ${rightPanelOpen ? 'open' : 'closed'}`}>
+          <div className="panel-header">
+            <span>{contentType === 'image' ? '🖼️ IMAGEN' : contentType === 'code' ? '💻 CÓDIGO' : contentType === 'data' ? '📊 DATOS' : contentType === 'link' ? '🔗 ENLACE' : '⚙ SISTEMA'}</span>
+            <button className="panel-close" onClick={() => setRightPanelOpen(false)}>×</button>
+          </div>
+          <div className="panel-content">
+            <div className="content-view">
+              <div className="content-type-badge">{contentType.toUpperCase()}</div>
+              <div className="content-body">{responseMessage}</div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Input inferior */}
+      <div className="input-panel">
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -215,7 +352,7 @@ export default function App() {
               setInputText('');
             }
           }}
-          style={{ display: 'flex', gap: '8px' }}
+          className="input-form"
         >
           <input
             type="text"
@@ -223,33 +360,61 @@ export default function App() {
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
             disabled={loading}
-            style={{
-              flex: 1,
-              padding: '10px 14px',
-              borderRadius: '8px',
-              border: '1px solid #374151',
-              background: '#1f2937',
-              color: '#fff',
-              outline: 'none',
-            }}
+            className="input-field"
           />
-          <button
-            type="submit"
-            disabled={loading}
-            style={{
-              padding: '10px 18px',
-              borderRadius: '8px',
-              border: 'none',
-              background: loading ? '#4b5563' : '#2563eb',
-              color: '#fff',
-              fontWeight: 600,
-              cursor: loading ? 'not-allowed' : 'pointer',
-            }}
-          >
+          <button type="submit" disabled={loading} className="input-button">
             {loading ? '...' : 'Enviar'}
           </button>
         </form>
       </div>
     </div>
+  );
+}
+
+// ============ AURA ============
+function AuraRing({ color, pulse = false, flash = false, offsetX = 0 }) {
+  const meshRef = React.useRef();
+
+  React.useEffect(() => {
+    if (!meshRef.current) return;
+    let frame;
+    let t = 0;
+    const animate = () => {
+      t += 0.05;
+      if (meshRef.current) {
+        const scale = flash ? 1.15 : pulse ? 1 + Math.sin(t) * 0.03 : 1;
+        meshRef.current.scale.setScalar(scale);
+        meshRef.current.material.opacity = flash ? 0.9 : pulse ? 0.45 + Math.sin(t) * 0.15 : 0.5;
+      }
+      frame = requestAnimationFrame(animate);
+    };
+    animate();
+    return () => cancelAnimationFrame(frame);
+  }, [pulse, flash]);
+
+  React.useEffect(() => {
+    if (!meshRef.current) return;
+    let frame;
+    const follow = () => {
+      if (meshRef.current) {
+        meshRef.current.position.x += (offsetX - meshRef.current.position.x) * 0.08;
+      }
+      frame = requestAnimationFrame(follow);
+    };
+    follow();
+    return () => cancelAnimationFrame(frame);
+  }, [offsetX]);
+
+  return (
+    <mesh ref={meshRef} position={[0, -0.85, 0]}>
+      <ringGeometry args={[0.75, 0.82, 80]} />
+      <meshBasicMaterial
+        color={color}
+        transparent
+        opacity={0.6}
+        side={2}
+        toneMapped={false}
+      />
+    </mesh>
   );
 }
