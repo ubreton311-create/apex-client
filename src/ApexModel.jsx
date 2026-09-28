@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useMemo } from 'react';
 import { useGLTF, useAnimations } from '@react-three/drei';
 import { useFrame } from '@react-three/fiber';
+import * as THREE from 'three';
 
 export function ApexModel({ robotState = 'idle', offsetX = 0, scaleTarget = 0.32 }) {
   const group = useRef();
@@ -9,50 +10,72 @@ export function ApexModel({ robotState = 'idle', offsetX = 0, scaleTarget = 0.32
 
   const STATE_TO_ANIM = useMemo(() => ({
     idle: 'Idle',
-    listening: 'Idle',
     thinking: 'Standing',
     talking: 'Yes',
-    wake: 'Wave',
+    sleeping: 'Idle',
   }), []);
 
-  // Cambio de animación según estado
+  useEffect(() => {
+    if (!actions) return;
+    Object.entries(actions).forEach(([name, action]) => {
+      if (!action) return;
+      if (name === 'Wave' || name === 'Yes' || name === 'Jump' || name === 'ThumbsUp') {
+        action.setLoop(THREE.LoopOnce, 1);
+        action.clampWhenFinished = true;
+      } else {
+        action.setLoop(THREE.LoopRepeat, Infinity);
+      }
+    });
+  }, [actions]);
+
   useEffect(() => {
     if (!actions || Object.keys(actions).length === 0) return;
     const animName = STATE_TO_ANIM[robotState] || 'Idle';
     const targetAction = actions[animName] || actions['Idle'];
 
     Object.values(actions).forEach(action => {
-      if (action && action !== targetAction) action.fadeOut(0.3);
+      if (action && action !== targetAction) {
+        action.fadeOut(0.3);
+      }
     });
 
-    if (targetAction) targetAction.reset().fadeIn(0.3).play();
+    if (targetAction) {
+      targetAction.reset().fadeIn(0.3).play();
+      if (robotState === 'sleeping') {
+        targetAction.timeScale = 0.1;
+      } else {
+        targetAction.timeScale = 1.0;
+      }
+    }
   }, [robotState, actions, STATE_TO_ANIM]);
 
-  // Animación inicial
   useEffect(() => {
     if (actions && Object.keys(actions).length > 0) {
       const idleAction = actions['Idle'] || Object.values(actions)[0];
-      idleAction?.reset().fadeIn(0.5).play();
+      if (idleAction) {
+        idleAction.setLoop(THREE.LoopRepeat, Infinity);
+        idleAction.reset().fadeIn(0.5).play();
+      }
     }
   }, [actions]);
 
-  // Animación dinámica: bobbing + posición + escala
   useFrame((state) => {
     if (!group.current) return;
     const t = state.clock.getElapsedTime();
 
     let bobbingY = 0;
     let rotZ = 0;
+
     if (robotState === 'talking') {
       bobbingY = Math.sin(t * 8) * 0.015;
       rotZ = Math.sin(t * 4) * 0.015;
-    } else if (robotState === 'wake') {
-      bobbingY = Math.abs(Math.sin(t * 3)) * 0.02;
+    } else if (robotState === 'sleeping') {
+      bobbingY = Math.sin(t * 0.6) * 0.012;
     }
 
     const targetX = offsetX;
     const targetY = -0.85 + bobbingY;
-    const targetScale = scaleTarget;
+    const targetScale = robotState === 'sleeping' ? scaleTarget * 0.82 : scaleTarget;
 
     group.current.position.x += (targetX - group.current.position.x) * 0.08;
     group.current.position.y += (targetY - group.current.position.y) * 0.15;

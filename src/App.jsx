@@ -1,41 +1,68 @@
-import React, { useState, Suspense, useEffect, useCallback } from 'react';
+import React, { useState, Suspense, useEffect, useCallback, useRef } from 'react';
 import { Canvas } from '@react-three/fiber';
 import { OrbitControls, ContactShadows } from '@react-three/drei';
 import { ApexModel } from './ApexModel';
-import { useVoiceAssistant } from './useVoiceAssistant';
 import './App.css';
 
 const STATE_COLORS = {
   idle: '#3b82f6',
-  listening: '#facc15',
   thinking: '#f97316',
   talking: '#10b981',
-  wake: '#00d4ff',
+  sleeping: '#1e3a8a',
 };
 
-// ============ DETECTOR DE CONTENIDO MEJORADO ============
 const detectContentType = (text) => {
   if (!text) return 'text';
-
-  // Bloques de código markdown
   if (text.includes('```')) return 'code';
-
-  // Patrones de código comunes (def, function, const, import, etc.)
   const codeKeywords = /\b(def |function |const |let |var |class |import |from |return |print\(|console\.log|=> |if \(|for \(|while \()/;
   const codeSymbols = /[{}();]|=>|::|==/;
   if (codeKeywords.test(text) && codeSymbols.test(text)) return 'code';
-
-  // Imágenes (markdown o URLs directas)
   if (text.match(/!\[.*\]\(.*\)/)) return 'image';
   if (text.match(/https?:\/\/[^\s]+\.(jpg|jpeg|png|gif|webp|svg)/i)) return 'image';
-
-  // Listas / datos
   if (text.match(/^[\-\*\d]+[\.\)]?\s/m)) return 'data';
-
-  // Enlaces
   if (text.match(/https?:\/\/[^\s]+/)) return 'link';
-
   return 'text';
+};
+
+const MAX_FILE_SIZE = 5 * 1024 * 1024;
+
+const compressImage = (file, maxWidth = 800, quality = 0.7) => {
+  return new Promise((resolve) => {
+    if (!file.type.startsWith('image/')) {
+      resolve(file);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let { width, height } = img;
+        if (width > maxWidth) {
+          height = (height * maxWidth) / width;
+          width = maxWidth;
+        }
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+        canvas.toBlob(
+          (blob) => {
+            const newFile = new File([blob], file.name.replace(/\.[^.]+$/, '.jpg'), {
+              type: 'image/jpeg',
+            });
+            resolve(newFile);
+          },
+          'image/jpeg',
+          quality
+        );
+      };
+      img.onerror = () => resolve(file);
+      img.src = e.target.result;
+    };
+    reader.onerror = () => resolve(file);
+    reader.readAsDataURL(file);
+  });
 };
 
 export default function App() {
@@ -44,16 +71,26 @@ export default function App() {
   const [responseMessage, setResponseMessage] = useState('');
   const [conversation, setConversation] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [lastTranscription, setLastTranscription] = useState('');
   const [leftPanelOpen, setLeftPanelOpen] = useState(false);
   const [rightPanelOpen, setRightPanelOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [flash, setFlash] = useState(false);
   const [contentType, setContentType] = useState('text');
+  const [isSleeping, setIsSleeping] = useState(false);
+  const [leftTab, setLeftTab] = useState('chat');
+  const [attachedFile, setAttachedFile] = useState(null);
+  const [uploadedFiles, setUploadedFiles] = useState([]);
+  const [showToast, setShowToast] = useState(null);
+  const fileInputRef = useRef(null);
+  const conversationEndRef = useRef(null);
 
   const N8N_CHAT_URL = '/api-n8n/webhook/apex-core';
 
-  // ============ DETECCIÓN MÓVIL ============
+  const showToastMsg = (text, duration = 2500) => {
+    setShowToast(text);
+    setTimeout(() => setShowToast(null), duration);
+  };
+
   useEffect(() => {
     const checkMobile = () => setIsMobile(window.innerWidth < 900);
     checkMobile();
@@ -61,7 +98,6 @@ export default function App() {
     return () => window.removeEventListener('resize', checkMobile);
   }, []);
 
-  // ============ RELOJ ============
   const [time, setTime] = useState(() => {
     const d = new Date();
     return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -74,7 +110,12 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
-  // ============ AUDIO UNLOCK ============
+  useEffect(() => {
+    if (conversationEndRef.current) {
+      conversationEndRef.current.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [conversation]);
+
   useEffect(() => {
     let unlocked = false;
     const unlockAudio = () => {
@@ -91,8 +132,6 @@ export default function App() {
         if (ctx.state === 'suspended') ctx.resume().then(() => ctx.close());
         else ctx.close();
       } catch (e) {}
-      document.removeEventListener('touchstart', unlockAudio);
-      document.removeEventListener('click', unlockAudio);
     };
     document.addEventListener('touchstart', unlockAudio, { once: true });
     document.addEventListener('click', unlockAudio, { once: true });
@@ -102,9 +141,8 @@ export default function App() {
     };
   }, []);
 
-  // ============ TTS ============
   const speakResponse = useCallback((text) => {
-    if (!window.speechSynthesis) return;
+    if (!window.speechSynthesis || isSleeping) return;
     window.speechSynthesis.cancel();
     setTimeout(() => {
       const u = new SpeechSynthesisUtterance(text);
@@ -117,8 +155,8 @@ export default function App() {
         const esp = voices.find(v => v.lang.startsWith('es'));
         if (esp) u.voice = esp;
         u.onstart = () => setRobotState('talking');
-        u.onend = () => setRobotState('idle');
-        u.onerror = () => setRobotState('idle');
+        u.onend = () => setRobotState(isSleeping ? 'sleeping' : 'idle');
+        u.onerror = () => setRobotState(isSleeping ? 'sleeping' : 'idle');
         window.speechSynthesis.speak(u);
       };
       if (window.speechSynthesis.getVoices().length === 0) {
@@ -128,27 +166,103 @@ export default function App() {
         };
       } else trySpeak();
     }, 100);
-  }, []);
+  }, [isSleeping]);
 
-  // ============ ENVIAR A APEX ============
-  const sendToApex = useCallback(async (text) => {
-    if (!text || !text.trim()) return;
+  const toggleSleep = (forceState) => {
+    const newState = typeof forceState === 'boolean' ? forceState : !isSleeping;
+    setIsSleeping(newState);
+    setRobotState(newState ? 'sleeping' : 'idle');
+    if (newState) {
+      if (window.speechSynthesis) window.speechSynthesis.cancel();
+      showToastMsg('😴 Apex descansando');
+    } else {
+      setFlash(true);
+      setTimeout(() => setFlash(false), 500);
+      showToastMsg('👋 Apex despierta');
+    }
+  };
+
+  const sendToApex = useCallback(async (text, file = null) => {
+    if ((!text || !text.trim()) && !file) return;
+
+    const lowerText = text.toLowerCase().trim();
+
+    // Comandos con APEX
+    if (/^(descansa|duerme|a dormir)\b/i.test(lowerText) || lowerText.includes('apex descansa') || lowerText.includes('apex duerme')) {
+      setConversation(prev => [...prev, {
+        role: 'user',
+        text,
+        time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }),
+      }]);
+      toggleSleep(true);
+      return;
+    }
+    if (/^(despierta|activáte|activate)\b/i.test(lowerText) || lowerText.includes('apex despierta') || lowerText.includes('apex actívate')) {
+      setConversation(prev => [...prev, {
+        role: 'user',
+        text,
+        time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }),
+      }]);
+      toggleSleep(false);
+      return;
+    }
+
+    if (isSleeping) {
+      setConversation(prev => [...prev, {
+        role: 'user',
+        text: text + ' (Apex está dormida, escribe "despierta")',
+        time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }),
+      }]);
+      return;
+    }
+
     setLoading(true);
     setRobotState('thinking');
-    setLastTranscription(text);
 
+    const fileInfo = file ? { name: file.name, size: file.size, type: file.type } : null;
     const newUserMsg = {
       role: 'user',
-      text,
+      text: text || '',
       time: new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit' }),
+      file: fileInfo,
     };
     setConversation(prev => [...prev, newUserMsg]);
 
+    if (file) {
+      setUploadedFiles(prev => [...prev, {
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        time: newUserMsg.time,
+      }]);
+    }
+
     try {
+      const body = {
+        message: text || '',
+        sessionId: 'user-001',
+      };
+
+      if (file) {
+        const processedFile = await compressImage(file);
+        const base64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result.split(',')[1]);
+          reader.onerror = reject;
+          reader.readAsDataURL(processedFile);
+        });
+        body.attachment = {
+          name: processedFile.name,
+          type: processedFile.type,
+          size: processedFile.size,
+          data: base64,
+        };
+      }
+
       const res = await fetch(N8N_CHAT_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: text, sessionId: 'user-001' }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
       const reply = data.reply || data.output || data.text || 'Sin respuesta';
@@ -163,7 +277,6 @@ export default function App() {
 
       const detected = detectContentType(reply);
       setContentType(detected);
-      console.log('🎯 Tipo de contenido detectado:', detected);
 
       if (!isMobile) setLeftPanelOpen(true);
       if (detected !== 'text' && !isMobile) setRightPanelOpen(true);
@@ -172,57 +285,67 @@ export default function App() {
     } catch (err) {
       console.error(err);
       setResponseMessage('Error al conectar con Apex');
-      setRobotState('idle');
+      setRobotState(isSleeping ? 'sleeping' : 'idle');
     } finally {
       setLoading(false);
     }
-  }, [speakResponse, isMobile]);
+  }, [speakResponse, isMobile, isSleeping]);
 
-  // ============ VOICE ASSISTANT ============
-  const { isAwake, isRecording, listening } = useVoiceAssistant({
-    onTranscription: sendToApex,
-  });
-
-  // ============ FLASH AL DESPERTAR ============
-  useEffect(() => {
-    if (isAwake) {
-      setFlash(true);
-      const t = setTimeout(() => setFlash(false), 500);
-      return () => clearTimeout(t);
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > MAX_FILE_SIZE) {
+      showToastMsg(`Archivo muy grande (máx 5MB)`);
+      e.target.value = '';
+      return;
     }
-  }, [isAwake]);
+    setAttachedFile(file);
+  };
 
-  // ============ DERIVAR ESTADO ============
-  useEffect(() => {
-    if (isRecording) setRobotState('thinking');
-    else if (isAwake) {
-      setRobotState('wake');
-      const t = setTimeout(() => setRobotState('listening'), 2000);
-      return () => clearTimeout(t);
-    } else if (listening && !loading && robotState !== 'talking') {
-      setRobotState('listening');
+  const removeAttachment = () => {
+    setAttachedFile(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const submitForm = (e) => {
+    e.preventDefault();
+    if (!inputText.trim() && !attachedFile) return;
+    sendToApex(inputText, attachedFile);
+    setInputText('');
+    removeAttachment();
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      if (inputText.trim() || attachedFile) {
+        sendToApex(inputText, attachedFile);
+        setInputText('');
+        removeAttachment();
+      }
     }
-  }, [isAwake, isRecording, listening, loading, robotState]);
+  };
 
   const statusLabel = {
     idle: '● EN ESPERA',
-    listening: '● ESCUCHANDO',
     thinking: '● PROCESANDO',
     talking: '● RESPONDIENDO',
-    wake: '● DESPERTANDO',
+    sleeping: '● DORMIDO',
   }[robotState] || '● EN ESPERA';
 
   const statusColor = STATE_COLORS[robotState] || STATE_COLORS.idle;
 
-  // ============ LÓGICA DE VISIBILIDAD ============
   const hasConversation = conversation.length > 0;
   const hasSpecialContent = contentType !== 'text' && responseMessage;
 
   const showRightPanel = !isMobile && hasSpecialContent && rightPanelOpen;
 
-  // Robot se mueve solo si panel derecho está abierto
   const robotOffsetX = showRightPanel ? -0.9 : 0;
   const robotScale = showRightPanel ? 0.28 : 0.32;
+
+  const inputPlaceholder = isSleeping
+    ? '😴 Apex durmiendo — escribe "despierta"'
+    : 'Escribe aquí...';
 
   return (
     <div className="apex-container">
@@ -242,7 +365,13 @@ export default function App() {
         <pointLight position={[5, 2, -2]} intensity={0.6} color={statusColor} />
 
         <Suspense fallback={null}>
-          <AuraRing color={statusColor} pulse={robotState !== 'idle'} flash={flash} offsetX={robotOffsetX} />
+          <AuraRing
+            color={statusColor}
+            pulse={robotState !== 'idle' && robotState !== 'sleeping'}
+            flash={flash}
+            offsetX={robotOffsetX}
+            dim={isSleeping}
+          />
 
           <ApexModel
             robotState={robotState}
@@ -264,30 +393,33 @@ export default function App() {
 
       <div className="hud hud-top-left">
         <div className="hud-time">{time}</div>
-        <div className="hud-version">APEX v0.4</div>
+        <div className="hud-version">APEX v0.8</div>
       </div>
 
       <div className="hud hud-top-right">
         <div className="hud-status" style={{ color: statusColor, textShadow: `0 0 10px ${statusColor}` }}>
           {statusLabel}
         </div>
+        <button
+          className={`sleep-btn ${isSleeping ? 'sleeping' : ''}`}
+          onClick={() => toggleSleep()}
+          title={isSleeping ? 'Despertar' : 'Dormir'}
+        >
+          {isSleeping ? '☀️ DESPERTAR' : '🌙 DORMIR'}
+        </button>
       </div>
 
       <div className="hud hud-bottom-left">
-        <div className="hud-mic">
-          <span className={`mic-dot ${listening ? 'active' : ''}`}></span>
-          MIC {listening ? 'ON' : 'OFF'}
+        <div className="hud-mode">
+          {isSleeping ? '😴 DORMIDO' : '💬 MODO TEXTO'}
         </div>
       </div>
 
-      <div className="hud hud-bottom-right">
-        {lastTranscription && (
-          <div className="hud-transcription">"{lastTranscription.slice(0, 60)}"</div>
-        )}
-      </div>
+      {showToast && (
+        <div className="toast-notification">{showToast}</div>
+      )}
 
-      {/* Toggle IZQUIERDO */}
-      {hasConversation && !isMobile && (
+      {(hasConversation || uploadedFiles.length > 0) && !isMobile && (
         <button
           className="panel-toggle panel-toggle-left"
           onClick={() => setLeftPanelOpen(!leftPanelOpen)}
@@ -296,7 +428,6 @@ export default function App() {
         </button>
       )}
 
-      {/* Toggle DERECHO */}
       {hasSpecialContent && !isMobile && (
         <button
           className="panel-toggle panel-toggle-right"
@@ -306,27 +437,89 @@ export default function App() {
         </button>
       )}
 
-      {/* Panel IZQUIERDO */}
-      {hasConversation && (
+      {(hasConversation || uploadedFiles.length > 0) && (
         <div className={`panel panel-left ${leftPanelOpen ? 'open' : 'closed'}`}>
           <div className="panel-header">
-            <span>💬 CONVERSACIÓN</span>
+            <div className="panel-tabs">
+              <button
+                className={`panel-tab ${leftTab === 'chat' ? 'active' : ''}`}
+                onClick={() => setLeftTab('chat')}
+                title="Conversación"
+              >
+                💬
+              </button>
+              <button
+                className={`panel-tab ${leftTab === 'history' ? 'active' : ''}`}
+                onClick={() => setLeftTab('history')}
+                title="Historial"
+              >
+                📜
+              </button>
+              <button
+                className={`panel-tab ${leftTab === 'files' ? 'active' : ''}`}
+                onClick={() => setLeftTab('files')}
+                title="Archivos"
+              >
+                📎
+              </button>
+            </div>
             <button className="panel-close" onClick={() => setLeftPanelOpen(false)}>×</button>
           </div>
+
           <div className="panel-content">
-            {conversation.map((msg, i) => (
-              <div key={i} className={`msg msg-${msg.role}`}>
-                <div className="msg-header">
-                  {msg.role === 'user' ? 'TÚ' : 'APEX'} · {msg.time}
-                </div>
-                <div className="msg-text">{msg.text}</div>
+            {leftTab === 'chat' && (
+              <>
+                {conversation.length === 0 ? (
+                  <div className="panel-empty">Sin conversación aún...</div>
+                ) : (
+                  <>
+                    {conversation.map((msg, i) => (
+                      <div key={i} className={`msg msg-${msg.role}`}>
+                        <div className="msg-header">
+                          {msg.role === 'user' ? 'TÚ' : 'APEX'} · {msg.time}
+                        </div>
+                        {msg.file && (
+                          <div className="msg-file">📎 {msg.file.name}</div>
+                        )}
+                        {msg.text && !msg.text.startsWith('📎 ') && (
+                          <div className="msg-text">{msg.text}</div>
+                        )}
+                      </div>
+                    ))}
+                    <div ref={conversationEndRef} />
+                  </>
+                )}
+              </>
+            )}
+
+            {leftTab === 'history' && (
+              <div className="panel-empty">
+                📜 Historial de sesiones<br/>
+                <span style={{ fontSize: '10px', opacity: 0.5 }}>Próximamente</span>
               </div>
-            ))}
+            )}
+
+            {leftTab === 'files' && (
+              <>
+                {uploadedFiles.length === 0 ? (
+                  <div className="panel-empty">Sin archivos subidos</div>
+                ) : (
+                  uploadedFiles.map((f, i) => (
+                    <div key={i} className="file-item">
+                      <div className="file-icon">{f.type.startsWith('image') ? '🖼️' : f.type.includes('pdf') ? '📕' : f.type.includes('audio') ? '🎵' : '📄'}</div>
+                      <div className="file-info">
+                        <div className="file-name">{f.name}</div>
+                        <div className="file-meta">{(f.size / 1024).toFixed(1)} KB · {f.time}</div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </>
+            )}
           </div>
         </div>
       )}
 
-      {/* Panel DERECHO */}
       {hasSpecialContent && (
         <div className={`panel panel-right ${rightPanelOpen ? 'open' : 'closed'}`}>
           <div className="panel-header">
@@ -342,23 +535,42 @@ export default function App() {
         </div>
       )}
 
-      {/* Input inferior */}
       <div className="input-panel">
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (inputText.trim()) {
-              sendToApex(inputText);
-              setInputText('');
-            }
-          }}
-          className="input-form"
-        >
+        {attachedFile && (
+          <div className="attachment-preview">
+            <div className="attachment-icon">
+              {attachedFile.type.startsWith('image') ? '🖼️' : attachedFile.type.includes('pdf') ? '📕' : attachedFile.type.includes('audio') ? '🎵' : '📄'}
+            </div>
+            <div className="attachment-info">
+              <div className="attachment-name">{attachedFile.name}</div>
+              <div className="attachment-size">{(attachedFile.size / 1024).toFixed(1)} KB</div>
+            </div>
+            <button type="button" className="attachment-remove" onClick={removeAttachment}>×</button>
+          </div>
+        )}
+
+        <form onSubmit={submitForm} className="input-form">
+          <input
+            type="file"
+            ref={fileInputRef}
+            style={{ display: 'none' }}
+            onChange={handleFileSelect}
+            accept="image/*,application/pdf,text/plain,.doc,.docx,.csv,audio/*,video/*"
+          />
+          <button
+            type="button"
+            className="attach-btn"
+            onClick={() => fileInputRef.current?.click()}
+            title="Adjuntar archivo"
+          >
+            📎
+          </button>
           <input
             type="text"
-            placeholder='Escribe o di "Nova" y habla...'
+            placeholder={inputPlaceholder}
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
+            onKeyDown={handleKeyDown}
             disabled={loading}
             className="input-field"
           />
@@ -371,8 +583,7 @@ export default function App() {
   );
 }
 
-// ============ AURA ============
-function AuraRing({ color, pulse = false, flash = false, offsetX = 0 }) {
+function AuraRing({ color, pulse = false, flash = false, offsetX = 0, dim = false }) {
   const meshRef = React.useRef();
 
   React.useEffect(() => {
@@ -383,14 +594,15 @@ function AuraRing({ color, pulse = false, flash = false, offsetX = 0 }) {
       t += 0.05;
       if (meshRef.current) {
         const scale = flash ? 1.15 : pulse ? 1 + Math.sin(t) * 0.03 : 1;
+        const baseOpacity = dim ? 0.15 : 0.6;
         meshRef.current.scale.setScalar(scale);
-        meshRef.current.material.opacity = flash ? 0.9 : pulse ? 0.45 + Math.sin(t) * 0.15 : 0.5;
+        meshRef.current.material.opacity = flash ? 0.9 : pulse ? 0.45 + Math.sin(t) * 0.15 : baseOpacity;
       }
       frame = requestAnimationFrame(animate);
     };
     animate();
     return () => cancelAnimationFrame(frame);
-  }, [pulse, flash]);
+  }, [pulse, flash, dim]);
 
   React.useEffect(() => {
     if (!meshRef.current) return;
